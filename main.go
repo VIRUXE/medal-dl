@@ -33,6 +33,34 @@ type quality struct {
 	label string // "source", "1080p", "720p", ...
 	rank  int    // source=0 so it sorts first; otherwise the pixel height
 	url   string
+	size  int64
+}
+
+func fetchSize(url string) int64 {
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", "https://medal.tv/")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0
+	}
+	return resp.ContentLength
+}
+
+func formatSize(n int64) string {
+	if n <= 0 {
+		return "unknown size"
+	}
+	return fmt.Sprintf("%.2f MiB", float64(n)/1048576)
 }
 
 type clip struct {
@@ -72,7 +100,7 @@ func decodeDoubleEscaped(s string) (string, error) {
 	return out, nil
 }
 
-func extractClip(html string) (clip, error) {
+func extractClip(html string, getSize bool) (clip, error) {
 	matches := reContentURLs.FindAllStringSubmatch(html, -1)
 	if len(matches) == 0 {
 		return clip{}, fmt.Errorf("no contentUrl fields found (clip may be private or page format changed)")
@@ -113,6 +141,24 @@ func extractClip(html string) (clip, error) {
 		return clip{}, fmt.Errorf("no usable qualities found on page")
 	}
 	sort.SliceStable(qs, func(i, j int) bool { return qs[i].rank < qs[j].rank })
+
+	// Fetch sizes in parallel if requested
+	if getSize {
+		type sizeResult struct {
+			index int
+			size  int64
+		}
+		results := make(chan sizeResult, len(qs))
+		for i, q := range qs {
+			go func(i int, url string) {
+				results <- sizeResult{i, fetchSize(url)}
+			}(i, q.url)
+		}
+		for range qs {
+			res := <-results
+			qs[res.index].size = res.size
+		}
+	}
 
 	title := ""
 	if tm := reTitleEmbedded.FindStringSubmatch(html); tm != nil {
@@ -156,12 +202,12 @@ func pickQuality(qs []quality, wanted string, in io.Reader, out io.Writer) (qual
 		return quality{}, fmt.Errorf("quality %q not available (have: %s)", wanted, strings.Join(avail, ", "))
 	}
 	if len(qs) == 1 {
-		fmt.Fprintf(out, "Only one quality available: %s\n", qs[0].label)
+		fmt.Fprintf(out, "Only one quality available: %s (%s)\n", qs[0].label, formatSize(qs[0].size))
 		return qs[0], nil
 	}
 	fmt.Fprintln(out, "Available qualities:")
 	for i, q := range qs {
-		fmt.Fprintf(out, "  [%d] %s\n", i+1, q.label)
+		fmt.Fprintf(out, "  [%d] %-10s (%s)\n", i+1, q.label, formatSize(q.size))
 	}
 	fmt.Fprintf(out, "Choose [1-%d, default 1]: ", len(qs))
 	line, _ := bufio.NewReader(in).ReadString('\n')
@@ -265,8 +311,9 @@ func run() error {
 	name := flag.String("n", "", "override filename (without extension)")
 	wanted := flag.String("q", "", "quality to pick without prompting (e.g. source, 720p, 1080p)")
 	listOnly := flag.Bool("list", false, "list available qualities and exit")
+	showSize := flag.Bool("s", true, "fetch and display video sizes")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-o DIR] [-n NAME] [-q QUALITY] [--list] <medal.tv clip URL>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-o DIR] [-n NAME] [-q QUALITY] [-s] [--list] <medal.tv clip URL>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -285,7 +332,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	c, err := extractClip(html)
+	c, err := extractClip(html, *showSize)
 	if err != nil {
 		return err
 	}
@@ -299,7 +346,7 @@ func run() error {
 	if *listOnly {
 		fmt.Println("Qualities:")
 		for _, q := range c.qualities {
-			fmt.Printf("  %s\n", q.label)
+			fmt.Printf("  %-10s (%s)\n", q.label, formatSize(q.size))
 		}
 		return nil
 	}
@@ -325,7 +372,7 @@ func run() error {
 	if i := strings.IndexByte(displayURL, '?'); i >= 0 {
 		displayURL = displayURL[:i]
 	}
-	fmt.Printf("Quality: %s\n", picked.label)
+	fmt.Printf("Quality: %s (%s)\n", picked.label, formatSize(picked.size))
 	fmt.Printf("Video  : %s\n", displayURL)
 	fmt.Printf("Saving : %s\n", dest)
 
